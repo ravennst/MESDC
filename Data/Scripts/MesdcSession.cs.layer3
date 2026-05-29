@@ -1,0 +1,1207 @@
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Text;
+using Sandbox.Definitions;
+using Sandbox.ModAPI;
+using VRage.Game.Components;
+using VRage.Utils;
+
+namespace MESDC
+{
+    [MySessionComponentDescriptor(MyUpdateOrder.NoUpdate)]
+    public class MesdcSession : MySessionComponentBase
+    {
+        // ─── Constants ────────────────────────────────────────────────────────
+
+        private const string MOD_TAG       = "[MESDC]";
+        private const string BASELINE_FILE = "MESDC-Baseline.xml";
+        private const string CONFIG_FILE   = "MESDC-Config.xml";
+        private const string CHAT_PREFIX   = "/MESDC";
+
+        private const string FACTION_VANILLA      = "(vanilla)";
+        private const string FACTION_UNTAGGED_MOD = "(untagged-mod)";
+
+        // ─── State ────────────────────────────────────────────────────────────
+
+        private bool _isServer            = false;
+        private bool _initDone            = false;
+        private bool _awaitingInitConfirm = false;
+
+        // ─── Lifecycle ────────────────────────────────────────────────────────
+
+        public override void LoadData()
+        {
+            _isServer = MyAPIGateway.Multiplayer.IsServer ||
+                        MyAPIGateway.Utilities.IsDedicated;
+
+            if (!_isServer)
+                return;
+
+            Log("LoadData: server detected, beginning startup sequence.");
+
+            try
+            {
+                RunStartupSequence();
+            }
+            catch (Exception ex)
+            {
+                Log("FATAL in LoadData: " + ex.ToString());
+            }
+        }
+
+        protected override void UnloadData()
+        {
+            if (!_isServer)
+                return;
+
+            if (MyAPIGateway.Utilities != null)
+                MyAPIGateway.Utilities.MessageEntered -= OnChatMessageEntered;
+
+            Log("UnloadData: MESDC unloaded.");
+        }
+
+        // ─── Startup Sequence ─────────────────────────────────────────────────
+
+        private void RunStartupSequence()
+        {
+            WriteBaseline();
+
+            if (!ConfigFileExists())
+            {
+                Log("No config file found. Generating from baseline.");
+                GenerateConfigFromBaseline();
+            }
+
+            ApplyConfig();
+
+            MyAPIGateway.Utilities.MessageEntered += OnChatMessageEntered;
+
+            _initDone = true;
+            Log("Startup sequence complete.");
+        }
+
+        // ─── Storage Helpers ─────────────────────────────────────────────────
+
+        private bool ConfigFileExists()
+        {
+            return MyAPIGateway.Utilities.FileExistsInWorldStorage(
+                CONFIG_FILE, typeof(MesdcSession));
+        }
+
+        private bool BaselineFileExists()
+        {
+            return MyAPIGateway.Utilities.FileExistsInWorldStorage(
+                BASELINE_FILE, typeof(MesdcSession));
+        }
+
+        private string ReadWorldFile(string filename)
+        {
+            try
+            {
+                using (TextReader reader = MyAPIGateway.Utilities
+                    .ReadFileInWorldStorage(filename, typeof(MesdcSession)))
+                {
+                    return reader.ReadToEnd();
+                }
+            }
+            catch (Exception ex)
+            {
+                Log("ReadWorldFile failed for " + filename + ": " + ex.Message);
+                return null;
+            }
+        }
+
+        private bool WriteWorldFile(string filename, string content)
+        {
+            try
+            {
+                using (TextWriter writer = MyAPIGateway.Utilities
+                    .WriteFileInWorldStorage(filename, typeof(MesdcSession)))
+                {
+                    writer.Write(content);
+                }
+                return true;
+            }
+            catch (Exception ex)
+            {
+                Log("WriteWorldFile failed for " + filename + ": " + ex.Message);
+                return false;
+            }
+        }
+
+        // ─── Layer 2: Baseline Writer (unchanged from Layer 2) ────────────────
+
+        private void WriteBaseline()
+        {
+            Log("WriteBaseline: reading SpawnGroup definitions.");
+
+            try
+            {
+                var factionMap = new Dictionary<string,
+                    List<SpawnGroupEntry>>(StringComparer.OrdinalIgnoreCase);
+
+                var spawnGroups = MyDefinitionManager.Static
+                    .GetSpawnGroupDefinitions();
+
+                int total = 0;
+
+                foreach (var sg in spawnGroups)
+                {
+                    if (sg == null || sg.Id.SubtypeId.String == null)
+                        continue;
+
+                    string subtypeId   = sg.Id.SubtypeId.String;
+                    string description = sg.DescriptionString ?? string.Empty;
+                    bool   isBaseGame  = sg.Context != null
+                                        && sg.Context.IsBaseGame;
+                    string modSource   = isBaseGame
+                        ? "BaseGame"
+                        : (sg.Context != null
+                            ? sg.Context.ModName + " (" + sg.Context.ModId + ")"
+                            : "Unknown");
+
+                    string rawFaction = ParseDescriptionTag(
+                        description, "FactionOwner", null);
+
+                    string faction;
+                    if (rawFaction != null)
+                        faction = rawFaction;
+                    else if (isBaseGame)
+                        faction = FACTION_VANILLA;
+                    else
+                        faction = FACTION_UNTAGGED_MOD;
+
+                    bool weaponRandomizer = string.Equals(
+                        ParseDescriptionTag(description,
+                            "UseWeaponRandomizerOnSpawn", "false"),
+                        "true", StringComparison.OrdinalIgnoreCase);
+
+                    var entry = new SpawnGroupEntry
+                    {
+                        SubtypeId        = subtypeId,
+                        Frequency        = sg.Frequency,
+                        WeaponRandomizer = weaponRandomizer,
+                        ModSource        = modSource,
+                        IsMesSpawnGroup  = description.IndexOf(
+                            "[Modular Encounters SpawnGroup]",
+                            StringComparison.OrdinalIgnoreCase) >= 0
+                    };
+
+                    if (!factionMap.ContainsKey(faction))
+                        factionMap[faction] = new List<SpawnGroupEntry>();
+
+                    factionMap[faction].Add(entry);
+                    total++;
+                }
+
+                // Mod-source promotion pass.
+                if (factionMap.ContainsKey(FACTION_UNTAGGED_MOD))
+                {
+                    var untagged = factionMap[FACTION_UNTAGGED_MOD];
+                    var byMod = new Dictionary<string, List<SpawnGroupEntry>>(
+                        StringComparer.OrdinalIgnoreCase);
+
+                    foreach (var entry in untagged)
+                    {
+                        string key = string.IsNullOrEmpty(entry.ModSource)
+                            ? FACTION_UNTAGGED_MOD
+                            : entry.ModSource;
+
+                        if (!byMod.ContainsKey(key))
+                            byMod[key] = new List<SpawnGroupEntry>();
+
+                        byMod[key].Add(entry);
+                    }
+
+                    factionMap.Remove(FACTION_UNTAGGED_MOD);
+
+                    foreach (var kvp in byMod)
+                    {
+                        string factionKey = string.Equals(
+                            kvp.Key, FACTION_UNTAGGED_MOD,
+                            StringComparison.OrdinalIgnoreCase)
+                            ? FACTION_UNTAGGED_MOD
+                            : kvp.Key;
+
+                        if (!factionMap.ContainsKey(factionKey))
+                            factionMap[factionKey] = new List<SpawnGroupEntry>();
+
+                        factionMap[factionKey].AddRange(kvp.Value);
+                    }
+                }
+
+                Log(string.Format(
+                    "WriteBaseline: found {0} SpawnGroups across {1} factions.",
+                    total, factionMap.Count));
+
+                string xml = BuildBaselineXml(factionMap);
+
+                if (WriteWorldFile(BASELINE_FILE, xml))
+                    Log("WriteBaseline: wrote " + BASELINE_FILE);
+                else
+                    Log("WriteBaseline: FAILED to write " + BASELINE_FILE);
+            }
+            catch (Exception ex)
+            {
+                Log("WriteBaseline: exception: " + ex.ToString());
+            }
+        }
+
+        private static string ParseDescriptionTag(
+            string description, string tagName, string defaultValue)
+        {
+            if (string.IsNullOrEmpty(description))
+                return defaultValue;
+
+            string search = "[" + tagName + ":";
+            int start = description.IndexOf(search,
+                StringComparison.OrdinalIgnoreCase);
+
+            if (start < 0)
+                return defaultValue;
+
+            int valueStart = start + search.Length;
+            int valueEnd   = description.IndexOf(']', valueStart);
+
+            if (valueEnd < 0)
+                return defaultValue;
+
+            return description.Substring(
+                valueStart, valueEnd - valueStart).Trim();
+        }
+
+        private string BuildBaselineXml(
+            Dictionary<string, List<SpawnGroupEntry>> factionMap)
+        {
+            var sb = new StringBuilder();
+
+            sb.AppendLine("<?xml version=\"1.0\" encoding=\"utf-8\"?>");
+            sb.AppendLine("<!-- MESDC-Baseline.xml");
+            sb.AppendLine("     Auto-generated on server startup from live");
+            sb.AppendLine("     MES SpawnGroup definitions BEFORE any MESDC");
+            sb.AppendLine("     overrides are applied. DO NOT hand-edit.");
+            sb.AppendLine("     Regenerated every server startup.");
+            sb.AppendLine("     Run /MESDC INIT to regenerate");
+            sb.AppendLine("     MESDC-Config.xml from this file. -->");
+            sb.AppendLine("<MESDC>");
+            sb.AppendLine();
+
+            sb.AppendLine("  <!-- ═══════════════════════════════════════════"
+                        + "═══════════════════");
+            sb.AppendLine("       GLOBAL OVERRIDES");
+            sb.AppendLine("       Populated with documented MES defaults.");
+            sb.AppendLine("       MESDC cannot read live MES config values");
+            sb.AppendLine("       from memory. Verify these against your MES");
+            sb.AppendLine("       config files before editing MESDC-Config.xml.");
+            sb.AppendLine("       MES config files are at:");
+            sb.AppendLine("         [WorldSave]\\Storage\\"
+                        + "1521905890.sbm_ModularEncountersSpawner\\");
+            sb.AppendLine("       ════════════════════════════════════════════"
+                        + "══════════════════ -->");
+            sb.AppendLine("  <GlobalOverrides>");
+            WriteGlobalOverridesDefaults(sb);
+            sb.AppendLine("  </GlobalOverrides>");
+            sb.AppendLine();
+
+            sb.AppendLine("  <!-- ═══════════════════════════════════════════"
+                        + "═══════════════════");
+            sb.AppendLine("       FACTIONS");
+            sb.AppendLine(string.Format(
+                "       {0} faction(s) detected from live SpawnGroup definitions.",
+                factionMap.Count));
+            sb.AppendLine("       ════════════════════════════════════════════"
+                        + "══════════════════ -->");
+            sb.AppendLine("  <Factions>");
+
+            var factionKeys = new List<string>(factionMap.Keys);
+            bool hasVanilla     = factionKeys.Remove(FACTION_VANILLA);
+            bool hasUntaggedMod = factionKeys.Remove(FACTION_UNTAGGED_MOD);
+            bool hasSprt        = factionKeys.Remove("SPRT");
+
+            factionKeys.Sort(StringComparer.OrdinalIgnoreCase);
+
+            if (hasSprt)
+                factionKeys.Insert(0, "SPRT");
+
+            if (hasVanilla)
+                factionKeys.Add(FACTION_VANILLA);
+            if (hasUntaggedMod)
+                factionKeys.Add(FACTION_UNTAGGED_MOD);
+
+            foreach (string faction in factionKeys)
+            {
+                bool isGoby = string.Equals(
+                    faction, "SPRT", StringComparison.OrdinalIgnoreCase);
+
+                WriteFactionBlock(sb, faction, factionMap[faction], isGoby);
+            }
+
+            sb.AppendLine("  </Factions>");
+            sb.AppendLine();
+            sb.AppendLine("</MESDC>");
+
+            return sb.ToString();
+        }
+
+        private void WriteGlobalOverridesDefaults(StringBuilder sb)
+        {
+            sb.AppendLine("    <General>");
+            sb.AppendLine("      <!-- MES Config-General.xml defaults -->");
+            sb.AppendLine("      <EnableLegacySpaceCargoShipDetection>true"
+                        + "</EnableLegacySpaceCargoShipDetection>");
+            sb.AppendLine("      <UseModIdSelectionForSpawning>true"
+                        + "</UseModIdSelectionForSpawning>");
+            sb.AppendLine("      <UseWeightedModIdSelection>true"
+                        + "</UseWeightedModIdSelection>");
+            sb.AppendLine("      <UseMaxNpcGrids>false</UseMaxNpcGrids>");
+            sb.AppendLine("      <MaxGlobalNpcGrids>30</MaxGlobalNpcGrids>");
+            sb.AppendLine("      <PlayerWatcherTimerTrigger>5"
+                        + "</PlayerWatcherTimerTrigger>");
+            sb.AppendLine("      <NpcCleanupCheckTimerTrigger>60"
+                        + "</NpcCleanupCheckTimerTrigger>");
+            sb.AppendLine("      <ThreatReductionHandicap>0"
+                        + "</ThreatReductionHandicap>");
+            sb.AppendLine("    </General>");
+
+            sb.AppendLine("    <Grids>");
+            sb.AppendLine("      <!-- MES Config-Grids.xml defaults -->");
+            sb.AppendLine("      <EnableGlobalNPCWeaponRandomizer>false"
+                        + "</EnableGlobalNPCWeaponRandomizer>");
+            sb.AppendLine("      <RandomWeaponChance>100"
+                        + "</RandomWeaponChance>");
+            sb.AppendLine("      <RandomWeaponSizeVariance>-1"
+                        + "</RandomWeaponSizeVariance>");
+            sb.AppendLine("      <EnableGlobalNPCShieldProvider>false"
+                        + "</EnableGlobalNPCShieldProvider>");
+            sb.AppendLine("      <ShieldProviderChance>100"
+                        + "</ShieldProviderChance>");
+            sb.AppendLine("      <UseNonPhysicalAmmoForNPCs>false"
+                        + "</UseNonPhysicalAmmoForNPCs>");
+            sb.AppendLine("      <RemoveContainerInventoryFromNPCs>false"
+                        + "</RemoveContainerInventoryFromNPCs>");
+            sb.AppendLine("    </Grids>");
+
+            sb.AppendLine("    <SpaceCargoShips />");
+            sb.AppendLine("    <RandomEncounters />");
+            sb.AppendLine("    <PlanetaryCargoShips />");
+            sb.AppendLine("    <PlanetaryInstallations />");
+            sb.AppendLine("    <BossEncounters />");
+            sb.AppendLine("    <Combat />");
+            sb.AppendLine("    <Cleanup />");
+        }
+
+        private void WriteFactionBlock(StringBuilder sb, string factionTag,
+            List<SpawnGroupEntry> entries, bool isGoby)
+        {
+            sb.AppendLine();
+
+            bool isVanilla     = string.Equals(factionTag,
+                FACTION_VANILLA, StringComparison.OrdinalIgnoreCase);
+            bool isUntaggedMod = string.Equals(factionTag,
+                FACTION_UNTAGGED_MOD, StringComparison.OrdinalIgnoreCase);
+            bool isPromotedMod = !isGoby && !isVanilla && !isUntaggedMod
+                && factionTag.Contains("(");
+
+            if (isGoby)
+            {
+                sb.AppendLine("    <!-- ╔════════════════════════════════════"
+                            + "═══════════════════════╗");
+                sb.AppendLine("         ║  " + factionTag
+                            + " — GOBY faction. Full annotation in"
+                            + " MESDC-Config.xml.  ║");
+                sb.AppendLine("         ╚════════════════════════════════════"
+                            + "═══════════════════════╝ -->");
+            }
+            else if (isPromotedMod)
+            {
+                sb.AppendLine("    <!-- Auto-promoted: mod-sourced SpawnGroups"
+                            + " with no [FactionOwner] tag,");
+                sb.AppendLine("         grouped by mod of origin."
+                            + " Tag = ModSource value for this mod.");
+                sb.AppendLine("         FactionEnabled and per-SpawnGroup"
+                            + " overrides are supported. -->");
+            }
+            else if (isVanilla)
+            {
+                sb.AppendLine("    <!-- (vanilla): vanilla SE SpawnGroups with"
+                            + " no [FactionOwner] tag.");
+                sb.AppendLine("         These are not a real MES faction."
+                            + " MESDC groups them here for reference.");
+                sb.AppendLine("         FactionEnabled and per-SpawnGroup"
+                            + " overrides are supported. -->");
+            }
+            else if (isUntaggedMod)
+            {
+                sb.AppendLine("    <!-- (untagged-mod): mod-added SpawnGroups"
+                            + " with no [FactionOwner] tag.");
+                sb.AppendLine("         These are not a real MES faction."
+                            + " Check ModSource attribute to identify origin.");
+                sb.AppendLine("         FactionEnabled and per-SpawnGroup"
+                            + " overrides are supported. -->");
+            }
+
+            sb.AppendLine("    <Faction Tag=\"" + factionTag + "\">");
+            sb.AppendLine("      <FactionEnabled>true</FactionEnabled>");
+            sb.AppendLine("      <SpawnGroups>");
+
+            foreach (var entry in entries)
+            {
+                sb.AppendLine("        <SpawnGroup SubtypeId=\""
+                            + entry.SubtypeId + "\""
+                            + " ModSource=\"" + entry.ModSource + "\">");
+                sb.AppendLine("          <Enabled>true</Enabled>");
+                sb.AppendLine(string.Format(
+                    "          <SpawnFrequency>{0:F1}</SpawnFrequency>",
+                    entry.Frequency));
+                sb.AppendLine("          <WeaponRandomizerEnabled>"
+                            + entry.WeaponRandomizer.ToString().ToLower()
+                            + "</WeaponRandomizerEnabled>");
+                sb.AppendLine("        </SpawnGroup>");
+            }
+
+            sb.AppendLine("      </SpawnGroups>");
+            sb.AppendLine("      <!-- RegionGating absent in Baseline."
+                        + " MESDC-only field. -->");
+            sb.AppendLine("    </Faction>");
+        }
+
+        private struct SpawnGroupEntry
+        {
+            public string SubtypeId;
+            public float  Frequency;
+            public bool   WeaponRandomizer;
+            public bool   IsMesSpawnGroup;
+            public string ModSource;
+        }
+
+        // ─── Layer 3: Config Generator ────────────────────────────────────────
+
+        /// <summary>
+        /// Parses MESDC-Baseline.xml and writes MESDC-Config.xml.
+        /// SPRT is written as the fully-annotated GOBY block.
+        /// All other factions get a minimal block.
+        /// Called on first run and by /MESDC INIT CONFIRM.
+        /// </summary>
+        private void GenerateConfigFromBaseline()
+        {
+            Log("GenerateConfigFromBaseline: reading baseline.");
+
+            string baselineXml = ReadWorldFile(BASELINE_FILE);
+            if (baselineXml == null)
+            {
+                Log("GenerateConfigFromBaseline: baseline not found, aborting.");
+                return;
+            }
+
+            try
+            {
+                var factions = ParseBaselineFactions(baselineXml);
+
+                Log(string.Format(
+                    "GenerateConfigFromBaseline: parsed {0} faction(s) " +
+                    "from baseline.", factions.Count));
+
+                string configXml = BuildConfigXml(factions);
+
+                if (WriteWorldFile(CONFIG_FILE, configXml))
+                    Log("GenerateConfigFromBaseline: wrote " + CONFIG_FILE);
+                else
+                    Log("GenerateConfigFromBaseline: FAILED to write "
+                        + CONFIG_FILE);
+            }
+            catch (Exception ex)
+            {
+                Log("GenerateConfigFromBaseline: exception: " + ex.ToString());
+            }
+        }
+
+        /// <summary>
+        /// Parses faction and spawngroup entries from a baseline XML string
+        /// using a hand-rolled line-by-line parser. XmlReader and XmlDocument
+        /// are blocked by the SE sandbox, so we parse the XML we wrote ourselves
+        /// directly. The baseline structure is fixed and predictable.
+        /// </summary>
+        private List<BaselineFaction> ParseBaselineFactions(string xml)
+        {
+            var factions = new List<BaselineFaction>();
+
+            if (string.IsNullOrEmpty(xml))
+                return factions;
+
+            BaselineFaction     currentFaction   = null;
+            BaselineSpawnGroup  currentSg        = new BaselineSpawnGroup();
+            bool                inSpawnGroup     = false;
+
+            string[] lines = xml.Split('\n');
+
+            foreach (string rawLine in lines)
+            {
+                string line = rawLine.Trim();
+
+                // Skip comments and blank lines.
+                if (line.Length == 0
+                    || line.StartsWith("<!--")
+                    || line.StartsWith("<?"))
+                    continue;
+
+                // <Faction Tag="X"> — start of a faction block.
+                if (line.StartsWith("<Faction "))
+                {
+                    string tag = ParseXmlAttribute(line, "Tag");
+                    currentFaction = new BaselineFaction
+                    {
+                        Tag         = tag,
+                        SpawnGroups = new List<BaselineSpawnGroup>()
+                    };
+                    factions.Add(currentFaction);
+                    inSpawnGroup = false;
+                    continue;
+                }
+
+                // </Faction> — end of faction block.
+                if (line.StartsWith("</Faction>"))
+                {
+                    currentFaction = null;
+                    inSpawnGroup   = false;
+                    continue;
+                }
+
+                if (currentFaction == null)
+                    continue;
+
+                // <SpawnGroup SubtypeId="X" ModSource="Y"> — start of entry.
+                if (line.StartsWith("<SpawnGroup "))
+                {
+                    currentSg = new BaselineSpawnGroup
+                    {
+                        SubtypeId        = ParseXmlAttribute(line, "SubtypeId"),
+                        ModSource        = ParseXmlAttribute(line, "ModSource"),
+                        Frequency        = 1.0f,
+                        WeaponRandomizer = false
+                    };
+                    inSpawnGroup = true;
+                    continue;
+                }
+
+                // </SpawnGroup> — commit entry to current faction.
+                if (line.StartsWith("</SpawnGroup>"))
+                {
+                    if (inSpawnGroup)
+                        currentFaction.SpawnGroups.Add(currentSg);
+
+                    inSpawnGroup = false;
+                    continue;
+                }
+
+                if (!inSpawnGroup)
+                    continue;
+
+                // Child elements of SpawnGroup.
+                string elemVal;
+
+                if (TryParseXmlElement(line, "SpawnFrequency", out elemVal))
+                {
+                    float f;
+                    if (float.TryParse(elemVal,
+                        System.Globalization.NumberStyles.Float,
+                        System.Globalization.CultureInfo.InvariantCulture,
+                        out f))
+                    {
+                        currentSg.Frequency = f;
+                    }
+                    continue;
+                }
+
+                if (TryParseXmlElement(line, "WeaponRandomizerEnabled",
+                    out elemVal))
+                {
+                    bool b;
+                    bool.TryParse(elemVal, out b);
+                    currentSg.WeaponRandomizer = b;
+                    continue;
+                }
+            }
+
+            return factions;
+        }
+
+        /// <summary>
+        /// Extracts the value of an XML attribute from a tag string.
+        /// e.g. ParseXmlAttribute("<Faction Tag=\"SPRT\">", "Tag") → "SPRT"
+        /// Returns empty string if not found.
+        /// </summary>
+        private static string ParseXmlAttribute(string line, string attrName)
+        {
+            string search = attrName + "=\"";
+            int start = line.IndexOf(search, StringComparison.Ordinal);
+            if (start < 0)
+                return string.Empty;
+
+            int valueStart = start + search.Length;
+            int valueEnd   = line.IndexOf('"', valueStart);
+            if (valueEnd < 0)
+                return string.Empty;
+
+            return line.Substring(valueStart, valueEnd - valueStart);
+        }
+
+        /// <summary>
+        /// Extracts the inner text of a simple XML element on a single line.
+        /// e.g. TryParseXmlElement("  <SpawnFrequency>5.0</SpawnFrequency>",
+        ///     "SpawnFrequency", out val) → true, val = "5.0"
+        /// Returns false if the element is not found on this line.
+        /// </summary>
+        private static bool TryParseXmlElement(string line, string elemName,
+            out string value)
+        {
+            value = string.Empty;
+            string open  = "<"  + elemName + ">";
+            string close = "</" + elemName + ">";
+
+            int start = line.IndexOf(open, StringComparison.Ordinal);
+            if (start < 0)
+                return false;
+
+            int valueStart = start + open.Length;
+            int valueEnd   = line.IndexOf(close, valueStart,
+                StringComparison.Ordinal);
+
+            if (valueEnd < 0)
+                return false;
+
+            value = line.Substring(valueStart, valueEnd - valueStart).Trim();
+            return true;
+        }
+
+        /// <summary>
+        /// Builds the MESDC-Config.xml string from a list of baseline factions.
+        /// SPRT gets the full GOBY annotation; all others get minimal blocks.
+        /// </summary>
+        private string BuildConfigXml(List<BaselineFaction> factions)
+        {
+            var sb = new StringBuilder();
+
+            sb.AppendLine("<?xml version=\"1.0\" encoding=\"utf-8\"?>");
+            sb.AppendLine("<!-- MESDC-Config.xml");
+            sb.AppendLine("     Admin override file. Edit this file to");
+            sb.AppendLine("     customise MES spawn behaviour.");
+            sb.AppendLine("     Omit or comment out any element to leave");
+            sb.AppendLine("     the corresponding MES value untouched.");
+            sb.AppendLine("     ───────────────────────────────────────────");
+            sb.AppendLine("     WARNING: /MESDC INIT will overwrite this");
+            sb.AppendLine("     file without confirmation. Back up your");
+            sb.AppendLine("     settings before running that command.");
+            sb.AppendLine("     A server restart is required for changes");
+            sb.AppendLine("     to take effect. -->");
+            sb.AppendLine("<MESDC>");
+            sb.AppendLine();
+
+            // ── GlobalOverrides ──────────────────────────────────────────────
+            WriteConfigGlobalOverrides(sb);
+
+            // ── Factions ─────────────────────────────────────────────────────
+            sb.AppendLine("  <!-- ═══════════════════════════════════════════"
+                        + "═══════════════════");
+            sb.AppendLine("       FACTIONS");
+            sb.AppendLine("       ════════════════════════════════════════════"
+                        + "══════════════════ -->");
+            sb.AppendLine("  <Factions>");
+
+            foreach (var faction in factions)
+            {
+                bool isGoby = string.Equals(
+                    faction.Tag, "SPRT", StringComparison.OrdinalIgnoreCase);
+
+                bool isReserved =
+                    string.Equals(faction.Tag, FACTION_VANILLA,
+                        StringComparison.OrdinalIgnoreCase) ||
+                    string.Equals(faction.Tag, FACTION_UNTAGGED_MOD,
+                        StringComparison.OrdinalIgnoreCase);
+
+                if (isGoby)
+                    WriteConfigGobyFaction(sb, faction);
+                else if (isReserved)
+                    WriteConfigReservedFaction(sb, faction);
+                else
+                    WriteConfigMinimalFaction(sb, faction);
+            }
+
+            sb.AppendLine("  </Factions>");
+            sb.AppendLine();
+            sb.AppendLine("</MESDC>");
+
+            return sb.ToString();
+        }
+
+        /// <summary>
+        /// Writes the full GlobalOverrides section for MESDC-Config.xml,
+        /// with every field documented and all list fields commented out.
+        /// </summary>
+        private void WriteConfigGlobalOverrides(StringBuilder sb)
+        {
+            sb.AppendLine("  <!-- ═══════════════════════════════════════════"
+                        + "═══════════════════");
+            sb.AppendLine("       GLOBAL OVERRIDES");
+            sb.AppendLine("       These values are written to the corresponding");
+            sb.AppendLine("       MES Config-*.xml files on server startup.");
+            sb.AppendLine("       Omit any element to leave MES defaults.");
+            sb.AppendLine("       Verify current MES values at:");
+            sb.AppendLine("         [WorldSave]\\Storage\\"
+                        + "1521905890.sbm_ModularEncountersSpawner\\");
+            sb.AppendLine("       ════════════════════════════════════════════"
+                        + "══════════════════ -->");
+            sb.AppendLine("  <GlobalOverrides>");
+
+            // ── General ──────────────────────────────────────────────────────
+            sb.AppendLine("    <General>");
+            sb.AppendLine("      <!-- Should older cargo ship mods without");
+            sb.AppendLine("           <IsCargoShip> still spawn? MES default: true -->");
+            sb.AppendLine("      <!-- <EnableLegacySpaceCargoShipDetection>true"
+                        + "</EnableLegacySpaceCargoShipDetection> -->");
+            sb.AppendLine();
+            sb.AppendLine("      <!-- Sort SpawnGroups by mod ID first, then");
+            sb.AppendLine("           randomly within. Prevents high-count mods");
+            sb.AppendLine("           crowding out others. MES default: true -->");
+            sb.AppendLine("      <!-- <UseModIdSelectionForSpawning>true"
+                        + "</UseModIdSelectionForSpawning> -->");
+            sb.AppendLine("      <!-- <UseWeightedModIdSelection>true"
+                        + "</UseWeightedModIdSelection> -->");
+            sb.AppendLine();
+            sb.AppendLine("      <!-- SpawnGroup count thresholds for weighting.");
+            sb.AppendLine("           MES defaults: Low=5, Medium=15, High=16 -->");
+            sb.AppendLine("      <!-- <LowWeightModIdSpawnGroups>5"
+                        + "</LowWeightModIdSpawnGroups> -->");
+            sb.AppendLine("      <!-- <LowWeightModIdModifier>1"
+                        + "</LowWeightModIdModifier> -->");
+            sb.AppendLine("      <!-- <MediumWeightModIdSpawnGroups>15"
+                        + "</MediumWeightModIdSpawnGroups> -->");
+            sb.AppendLine("      <!-- <MediumWeightModIdModifier>2"
+                        + "</MediumWeightModIdModifier> -->");
+            sb.AppendLine("      <!-- <HighWeightModIdSpawnGroups>16"
+                        + "</HighWeightModIdSpawnGroups> -->");
+            sb.AppendLine("      <!-- <HighWeightModIdModifier>3"
+                        + "</HighWeightModIdModifier> -->");
+            sb.AppendLine();
+            sb.AppendLine("      <!-- Cap total NPC grids in world.");
+            sb.AppendLine("           MES defaults: false / 30 -->");
+            sb.AppendLine("      <!-- <UseMaxNpcGrids>false</UseMaxNpcGrids> -->");
+            sb.AppendLine("      <!-- <MaxGlobalNpcGrids>30</MaxGlobalNpcGrids> -->");
+            sb.AppendLine();
+            sb.AppendLine("      <!-- Spawner check intervals (seconds).");
+            sb.AppendLine("           MES defaults: PlayerWatcher=5, Cleanup=60 -->");
+            sb.AppendLine("      <!-- <PlayerWatcherTimerTrigger>5"
+                        + "</PlayerWatcherTimerTrigger> -->");
+            sb.AppendLine("      <!-- <NpcDistanceCheckTimerTrigger>5"
+                        + "</NpcDistanceCheckTimerTrigger> -->");
+            sb.AppendLine("      <!-- <NpcOwnershipCheckTimerTrigger>60"
+                        + "</NpcOwnershipCheckTimerTrigger> -->");
+            sb.AppendLine("      <!-- <NpcCleanupCheckTimerTrigger>60"
+                        + "</NpcCleanupCheckTimerTrigger> -->");
+            sb.AppendLine();
+            sb.AppendLine("      <!-- Subtracted from all threat scores.");
+            sb.AppendLine("           Negative = harder. MES default: 0 -->");
+            sb.AppendLine("      <!-- <ThreatReductionHandicap>0"
+                        + "</ThreatReductionHandicap> -->");
+            sb.AppendLine();
+            sb.AppendLine("      <!-- Planet SubtypeIds where ALL spawning"
+                        + " is disabled. -->");
+            sb.AppendLine("      <!-- <PlanetSpawnsDisableList>");
+            sb.AppendLine("             <string>EarthLike</string>");
+            sb.AppendLine("           </PlanetSpawnsDisableList> -->");
+            sb.AppendLine();
+            sb.AppendLine("      <!-- SpawnGroup SubtypeIds removed from the"
+                        + " pool globally. -->");
+            sb.AppendLine("      <!-- <NpcSpawnGroupBlacklist>");
+            sb.AppendLine("             <string>SpawnGroupSubtypeIdHere</string>");
+            sb.AppendLine("           </NpcSpawnGroupBlacklist> -->");
+            sb.AppendLine("    </General>");
+
+            // ── Grids ─────────────────────────────────────────────────────────
+            sb.AppendLine("    <Grids>");
+            sb.AppendLine("      <!-- ~~~ Weapon Randomizer ~~~~~~~~~~~~~~~~~~");
+            sb.AppendLine("           Master switch. Per-faction");
+            sb.AppendLine("           WeaponRandomizerEnabled has no effect");
+            sb.AppendLine("           if this is false. MES default: false -->");
+            sb.AppendLine("      <!-- <EnableGlobalNPCWeaponRandomizer>false"
+                        + "</EnableGlobalNPCWeaponRandomizer> -->");
+            sb.AppendLine("      <!-- <RandomWeaponChance>100"
+                        + "</RandomWeaponChance> -->");
+            sb.AppendLine("      <!-- Variance: -1=no check, 0=exact,"
+                        + " N=±N blocks. MES default: -1 -->");
+            sb.AppendLine("      <!-- <RandomWeaponSizeVariance>-1"
+                        + "</RandomWeaponSizeVariance> -->");
+            sb.AppendLine("      <!-- <WeaponReplacerBlacklist>");
+            sb.AppendLine("             <string>WeaponSubtypeOrModIdHere</string>");
+            sb.AppendLine("           </WeaponReplacerBlacklist> -->");
+            sb.AppendLine("      <!-- <WeaponReplacerWhitelist>");
+            sb.AppendLine("             <string>WeaponSubtypeOrModIdHere</string>");
+            sb.AppendLine("           </WeaponReplacerWhitelist> -->");
+            sb.AppendLine("      <!-- <WeaponReplacerTargetBlacklist>");
+            sb.AppendLine("             <string>WeaponSubtypeOrModIdHere</string>");
+            sb.AppendLine("           </WeaponReplacerTargetBlacklist> -->");
+            sb.AppendLine("      <!-- <WeaponReplacerTargetWhitelist>");
+            sb.AppendLine("             <string>WeaponSubtypeOrModIdHere</string>");
+            sb.AppendLine("           </WeaponReplacerTargetWhitelist> -->");
+            sb.AppendLine("      <!-- <WeaponReplacerUseTotalGridMassMultiplier>"
+                        + "false</WeaponReplacerUseTotalGridMassMultiplier> -->");
+            sb.AppendLine("      <!-- <WeaponReplacerTotalGridMassMultiplier>1.5"
+                        + "</WeaponReplacerTotalGridMassMultiplier> -->");
+            sb.AppendLine("      <!-- <RandomizedWeaponsUseFullRange>false"
+                        + "</RandomizedWeaponsUseFullRange> -->");
+            sb.AppendLine();
+            sb.AppendLine("      <!-- ~~~ Shield Provider ~~~~~~~~~~~~~~~~~~~~");
+            sb.AppendLine("           MES default: false -->");
+            sb.AppendLine("      <!-- <EnableGlobalNPCShieldProvider>false"
+                        + "</EnableGlobalNPCShieldProvider> -->");
+            sb.AppendLine("      <!-- <ShieldProviderChance>100"
+                        + "</ShieldProviderChance> -->");
+            sb.AppendLine();
+            sb.AppendLine("      <!-- ~~~ Block Replacer ~~~~~~~~~~~~~~~~~~~~~");
+            sb.AppendLine("           Use /MES.GetBlockDefinitions in-game");
+            sb.AppendLine("           to retrieve block IDs. -->");
+            sb.AppendLine("      <!-- <UseGlobalBlockReplacer>false"
+                        + "</UseGlobalBlockReplacer> -->");
+            sb.AppendLine("      <!-- <GlobalBlockReplacerReference>");
+            sb.AppendLine("             <string>OldBlockId|NewBlockId</string>");
+            sb.AppendLine("           </GlobalBlockReplacerReference> -->");
+            sb.AppendLine();
+            sb.AppendLine("      <!-- ~~~ Ammo & Inventory ~~~~~~~~~~~~~~~~~~~");
+            sb.AppendLine("           MES defaults: false / false / false -->");
+            sb.AppendLine("      <!-- <UseNonPhysicalAmmoForNPCs>false"
+                        + "</UseNonPhysicalAmmoForNPCs> -->");
+            sb.AppendLine("      <!-- <RemoveContainerInventoryFromNPCs>false"
+                        + "</RemoveContainerInventoryFromNPCs> -->");
+            sb.AppendLine("      <!-- <UseMaxAmmoInventoryWeight>false"
+                        + "</UseMaxAmmoInventoryWeight> -->");
+            sb.AppendLine("      <!-- <MaxAmmoInventoryWeight>0"
+                        + "</MaxAmmoInventoryWeight> -->");
+            sb.AppendLine("    </Grids>");
+
+            // ── Encounter types (abbreviated — full schema in schema doc) ─────
+            sb.AppendLine("    <!-- SpaceCargoShips, RandomEncounters,");
+            sb.AppendLine("         PlanetaryCargoShips, PlanetaryInstallations,");
+            sb.AppendLine("         BossEncounters, Combat, Cleanup —");
+            sb.AppendLine("         see MESDC-Schema-Design.md for full field");
+            sb.AppendLine("         listings. Add elements here to override. -->");
+            sb.AppendLine("    <SpaceCargoShips />");
+            sb.AppendLine("    <RandomEncounters />");
+            sb.AppendLine("    <PlanetaryCargoShips />");
+            sb.AppendLine("    <PlanetaryInstallations />");
+            sb.AppendLine("    <BossEncounters />");
+            sb.AppendLine("    <Combat />");
+            sb.AppendLine("    <Cleanup />");
+
+            sb.AppendLine("  </GlobalOverrides>");
+            sb.AppendLine();
+        }
+
+        /// <summary>
+        /// Writes the full GOBY-annotated SPRT faction block for MESDC-Config.xml.
+        /// Every override field is present, documented, and set to its default.
+        /// </summary>
+        private void WriteConfigGobyFaction(StringBuilder sb,
+            BaselineFaction faction)
+        {
+            sb.AppendLine();
+            sb.AppendLine("    <!-- ╔══════════════════════════════════════════"
+                        + "═══════════════════╗");
+            sb.AppendLine("         ║  SPRT — Space Pirates (vanilla Keen"
+                        + " faction)                    ║");
+            sb.AppendLine("         ║  GOBY: Every available override is shown"
+                        + " and documented.    ║");
+            sb.AppendLine("         ║  Copy elements from this block into other"
+                        + " faction blocks.   ║");
+            sb.AppendLine("         ╚══════════════════════════════════════════"
+                        + "═══════════════════╝ -->");
+            sb.AppendLine("    <Faction Tag=\"SPRT\">");
+            sb.AppendLine();
+            sb.AppendLine("      <!-- Disable this entire faction.");
+            sb.AppendLine("           All SpawnGroups are blacklisted at load.");
+            sb.AppendLine("           Default: true -->");
+            sb.AppendLine("      <FactionEnabled>true</FactionEnabled>");
+            sb.AppendLine();
+            sb.AppendLine("      <!-- ~~~ Region Gating (MESDC feature) ~~~~~~");
+            sb.AppendLine("           Lock or exclude this faction from");
+            sb.AppendLine("           geographic regions.");
+            sb.AppendLine("           Mode: Lock   = ONLY spawns inside");
+            sb.AppendLine("                 Exclude = NEVER spawns inside");
+            sb.AppendLine("           Remove this block entirely for no gating.");
+            sb.AppendLine("           Region types: GPS, Planet, Gravity -->");
+            sb.AppendLine("      <!-- <RegionGating Mode=\"Lock\">");
+            sb.AppendLine("             <Region Type=\"GPS\">");
+            sb.AppendLine("               <Label>ExampleRegion</Label>");
+            sb.AppendLine("               <X>0</X>");
+            sb.AppendLine("               <Y>0</Y>");
+            sb.AppendLine("               <Z>0</Z>");
+            sb.AppendLine("               <RadiusM>100000</RadiusM>");
+            sb.AppendLine("             </Region>");
+            sb.AppendLine("             <Region Type=\"Planet\">");
+            sb.AppendLine("               <PlanetName>EarthLike</PlanetName>");
+            sb.AppendLine("             </Region>");
+            sb.AppendLine("             <Region Type=\"Gravity\">");
+            sb.AppendLine("               <MinG>0.0</MinG>");
+            sb.AppendLine("               <MaxG>0.5</MaxG>");
+            sb.AppendLine("             </Region>");
+            sb.AppendLine("           </RegionGating> -->");
+            sb.AppendLine();
+            sb.AppendLine("      <SpawnGroups>");
+
+            foreach (var sg in faction.SpawnGroups)
+            {
+                sb.AppendLine("        <!-- ModSource: " + sg.ModSource + " -->");
+                sb.AppendLine("        <SpawnGroup SubtypeId=\""
+                            + sg.SubtypeId + "\">");
+                sb.AppendLine();
+                sb.AppendLine("          <!-- Blacklist this SpawnGroup.");
+                sb.AppendLine("               Default: true -->");
+                sb.AppendLine("          <Enabled>true</Enabled>");
+                sb.AppendLine();
+                sb.AppendLine("          <!-- Absolute spawn frequency.");
+                sb.AppendLine("               Scale: 0.0 (never) to 10.0 (max).");
+                sb.AppendLine("               Omit to keep authored value.");
+                sb.AppendLine("               Authored value: "
+                            + sg.Frequency.ToString("F1") + " -->");
+                sb.AppendLine("          <!-- <SpawnFrequency>"
+                            + sg.Frequency.ToString("F1")
+                            + "</SpawnFrequency> -->");
+                sb.AppendLine();
+                sb.AppendLine("          <!-- Enable weapon randomization.");
+                sb.AppendLine("               Requires EnableGlobalNPCWeaponRandomizer.");
+                sb.AppendLine("               Default: false -->");
+                sb.AppendLine("          <WeaponRandomizerEnabled>"
+                            + sg.WeaponRandomizer.ToString().ToLower()
+                            + "</WeaponRandomizerEnabled>");
+                sb.AppendLine();
+                sb.AppendLine("        </SpawnGroup>");
+                sb.AppendLine();
+            }
+
+            sb.AppendLine("      </SpawnGroups>");
+            sb.AppendLine("    </Faction>");
+        }
+
+        /// <summary>
+        /// Writes a minimal faction block for non-GOBY named factions.
+        /// SpawnFrequency and WeaponRandomizerEnabled are commented out.
+        /// Enabled is active so admins see the list without accidental changes.
+        /// </summary>
+        private void WriteConfigMinimalFaction(StringBuilder sb,
+            BaselineFaction faction)
+        {
+            sb.AppendLine();
+            sb.AppendLine("    <!-- ── " + faction.Tag
+                        + " ─────────────────────────────────────────────");
+            sb.AppendLine("         Copy override elements from the SPRT GOBY");
+            sb.AppendLine("         block above as needed. Omitted elements");
+            sb.AppendLine("         leave MES defaults untouched. -->");
+            sb.AppendLine("    <Faction Tag=\"" + faction.Tag + "\">");
+            sb.AppendLine("      <FactionEnabled>true</FactionEnabled>");
+            sb.AppendLine("      <!-- <RegionGating Mode=\"Lock\"> ... "
+                        + "</RegionGating> -->");
+            sb.AppendLine("      <SpawnGroups>");
+
+            foreach (var sg in faction.SpawnGroups)
+            {
+                sb.AppendLine("        {SpawnGroup SubtypeId=\""
+                            + sg.SubtypeId + "\"");
+                sb.AppendLine("          Enabled: true");
+                sb.AppendLine("          SpawnFrequency authored: "
+                            + sg.Frequency.ToString("F1")
+                            + "  (add SpawnFrequency element to override)");
+                sb.AppendLine("          WeaponRandomizerEnabled: false}");
+            }
+
+            sb.AppendLine("      </SpawnGroups>");
+            sb.AppendLine("    </Faction>");
+        }
+
+        /// <summary>
+        /// Writes a reserved faction block ((vanilla) or (untagged-mod)).
+        /// Same as minimal but with a note explaining the reserved tag.
+        /// </summary>
+        private void WriteConfigReservedFaction(StringBuilder sb,
+            BaselineFaction faction)
+        {
+            bool isVanilla = string.Equals(faction.Tag, FACTION_VANILLA,
+                StringComparison.OrdinalIgnoreCase);
+
+            sb.AppendLine();
+            sb.AppendLine("    <!-- ── " + faction.Tag
+                        + " ─────────────────────────────────────");
+            if (isVanilla)
+            {
+                sb.AppendLine("         Vanilla SE SpawnGroups with no"
+                            + " [FactionOwner] tag.");
+                sb.AppendLine("         FactionEnabled=false disables ALL"
+                            + " vanilla cargo ship spawning. -->");
+            }
+            else
+            {
+                sb.AppendLine("         Mod-added SpawnGroups with no"
+                            + " [FactionOwner] tag and unknown ModSource.");
+                sb.AppendLine("         Check MESDC-Baseline.xml ModSource"
+                            + " attributes to identify origin. -->");
+            }
+
+            sb.AppendLine("    <Faction Tag=\"" + faction.Tag + "\">");
+            sb.AppendLine("      <FactionEnabled>true</FactionEnabled>");
+            sb.AppendLine("      <SpawnGroups>");
+
+            foreach (var sg in faction.SpawnGroups)
+            {
+                sb.AppendLine("        {SpawnGroup SubtypeId=\""
+                            + sg.SubtypeId + "\"");
+                sb.AppendLine("          Enabled: true");
+                sb.AppendLine("          SpawnFrequency authored: "
+                            + sg.Frequency.ToString("F1")
+                            + "  (add SpawnFrequency element to override)");
+                sb.AppendLine("          WeaponRandomizerEnabled: false}");
+            }
+
+            sb.AppendLine("      </SpawnGroups>");
+            sb.AppendLine("    </Faction>");
+        }
+
+        // ─── Baseline parse types ─────────────────────────────────────────────
+
+        private class BaselineFaction
+        {
+            public string Tag;
+            public List<BaselineSpawnGroup> SpawnGroups;
+        }
+
+        private struct BaselineSpawnGroup
+        {
+            public string SubtypeId;
+            public string ModSource;
+            public float  Frequency;
+            public bool   WeaponRandomizer;
+        }
+
+        // ─── Startup Step Stub (Layer 4) ──────────────────────────────────────
+
+        private void ApplyConfig()
+        {
+            Log("ApplyConfig: STUB — not yet implemented.");
+        }
+
+        // ─── Chat Command Handler ─────────────────────────────────────────────
+
+        private void OnChatMessageEntered(string messageText,
+            ref bool sendToOthers)
+        {
+            if (!messageText.StartsWith(CHAT_PREFIX,
+                    StringComparison.OrdinalIgnoreCase))
+                return;
+
+            sendToOthers = false;
+
+            if (!IsCallerAdmin())
+            {
+                SendReply("MESDC commands are admin-only.");
+                return;
+            }
+
+            string command = messageText.Trim();
+
+            if (string.Equals(command, CHAT_PREFIX + " INIT CONFIRM",
+                    StringComparison.OrdinalIgnoreCase))
+            {
+                if (_awaitingInitConfirm)
+                {
+                    _awaitingInitConfirm = false;
+                    HandleInitConfirmed();
+                }
+                else
+                {
+                    SendReply("No pending INIT request. "
+                            + "Type /MESDC INIT first.");
+                }
+                return;
+            }
+
+            if (string.Equals(command, CHAT_PREFIX + " INIT",
+                    StringComparison.OrdinalIgnoreCase))
+            {
+                HandleInit();
+                return;
+            }
+
+            SendReply("Unknown command. Available commands: /MESDC INIT");
+        }
+
+        private void HandleInit()
+        {
+            if (!_initDone)
+            {
+                SendReply("MESDC is still initialising. "
+                        + "Try again in a moment.");
+                return;
+            }
+
+            if (!BaselineFileExists())
+            {
+                SendReply("ERROR: No baseline file found. "
+                        + "Restart the server to regenerate the baseline.");
+                return;
+            }
+
+            _awaitingInitConfirm = true;
+            Log("/MESDC INIT invoked — awaiting confirmation.");
+            SendReply("WARNING: /MESDC INIT will overwrite MESDC-Config.xml "
+                    + "and discard ALL existing overrides. "
+                    + "Back up MESDC-Config.xml before proceeding. "
+                    + "Type /MESDC INIT CONFIRM to continue, "
+                    + "or any other command to cancel.");
+        }
+
+        private void HandleInitConfirmed()
+        {
+            if (!_initDone)
+            {
+                SendReply("MESDC is still initialising.");
+                return;
+            }
+
+            Log("/MESDC INIT CONFIRM: regenerating config from baseline.");
+            SendReply("Regenerating MESDC-Config.xml from baseline...");
+
+            try
+            {
+                GenerateConfigFromBaseline();
+                SendReply("Done. MESDC-Config.xml has been regenerated. "
+                        + "Restart the server for changes to take effect.");
+                Log("/MESDC INIT CONFIRM: complete.");
+            }
+            catch (Exception ex)
+            {
+                Log("/MESDC INIT CONFIRM failed: " + ex.ToString());
+                SendReply("ERROR: Config regeneration failed. "
+                        + "Check server log.");
+            }
+        }
+
+        // ─── Utilities ────────────────────────────────────────────────────────
+
+        private bool IsCallerAdmin()
+        {
+            var player = MyAPIGateway.Session.LocalHumanPlayer;
+            if (player == null)
+                return true;
+
+            return MyAPIGateway.Session.IsUserAdmin(player.SteamUserId);
+        }
+
+        private void SendReply(string message)
+        {
+            MyAPIGateway.Utilities.ShowMessage(MOD_TAG, message);
+        }
+
+        private static void Log(string message)
+        {
+            MyLog.Default.WriteLineAndConsole(
+                string.Format("{0} {1}", MOD_TAG, message));
+        }
+    }
+}
