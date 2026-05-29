@@ -10,6 +10,9 @@ using VRageMath;
 
 namespace MESDC
 {
+    // ─── Update order changed to AfterSimulation ──────────────────────────────
+    // Required to poll MESApiReady after LoadData registers the message handler.
+    // Once the apply pass is complete the update hook unregisters itself.
     [MySessionComponentDescriptor(MyUpdateOrder.AfterSimulation)]
     public class MesdcSession : MySessionComponentBase
     {
@@ -23,6 +26,7 @@ namespace MESDC
         private const string FACTION_VANILLA      = "(vanilla)";
         private const string FACTION_UNTAGGED_MOD = "(untagged-mod)";
 
+        // MES Workshop ID — used to register the API message handler.
         private const long MES_MOD_ID = 1521905890L;
 
         // ─── State ────────────────────────────────────────────────────────────
@@ -33,18 +37,7 @@ namespace MESDC
         private bool _applyPassComplete    = false;
 
         // MES API
-        private MesApi _mes = null;
-
-        // Region gating data — built during ApplyConfig, queried per spawn.
-        // Maps SpawnGroup SubtypeId → faction tag for callback lookup.
-        private Dictionary<string, string> _spawnGroupFactionMap
-            = new Dictionary<string, string>(
-                StringComparer.OrdinalIgnoreCase);
-
-        // Maps faction tag → region gating rules from config.
-        private Dictionary<string, FactionGatingRules> _factionGatingRules
-            = new Dictionary<string, FactionGatingRules>(
-                StringComparer.OrdinalIgnoreCase);
+        private MesApi _mes                = null;
 
         // ─── Lifecycle ────────────────────────────────────────────────────────
 
@@ -60,7 +53,10 @@ namespace MESDC
 
             try
             {
+                // Initialise MES API — registers message handler.
+                // MesApi.Ready will become true once MES broadcasts its dict.
                 _mes = new MesApi();
+
                 RunStartupSequence();
             }
             catch (Exception ex)
@@ -77,18 +73,12 @@ namespace MESDC
             if (MyAPIGateway.Utilities != null)
                 MyAPIGateway.Utilities.MessageEntered -= OnChatMessageEntered;
 
-            // Unregister the spawn condition callback.
-            if (_mes != null)
-            {
-                _mes.RegisterCustomSpawnCondition(false, "MESDC-RegionGate",
-                    OnSpawnConditionCheck);
-                _mes.UnregisterListener();
-            }
+            _mes?.UnregisterListener();
 
             Log("UnloadData: MESDC unloaded.");
         }
 
-        // ─── Per-tick update ─────────────────────────────────────────────────
+        // ─── Per-tick update — polls for MES API ready ────────────────────────
 
         public override void UpdateAfterSimulation()
         {
@@ -98,6 +88,7 @@ namespace MESDC
             if (_mes == null || !_mes.Ready)
                 return;
 
+            // MES API is ready. Run the apply pass once then stop polling.
             try
             {
                 ApplyConfig();
@@ -124,7 +115,11 @@ namespace MESDC
                 GenerateConfigFromBaseline();
             }
 
+            // ApplyConfig() is deferred to UpdateAfterSimulation until
+            // MES API is ready. Register chat handler now so /MESDC commands
+            // work even before the apply pass completes.
             MyAPIGateway.Utilities.MessageEntered += OnChatMessageEntered;
+
             Log("Baseline and config ready. Waiting for MES API...");
         }
 
@@ -242,6 +237,7 @@ namespace MESDC
                     total++;
                 }
 
+                // Mod-source promotion pass.
                 if (factionMap.ContainsKey(FACTION_UNTAGGED_MOD))
                 {
                     var untagged = factionMap[FACTION_UNTAGGED_MOD];
@@ -280,14 +276,6 @@ namespace MESDC
                 Log(string.Format(
                     "WriteBaseline: found {0} SpawnGroups across {1} factions.",
                     total, factionMap.Count));
-
-                // Build the SpawnGroup-to-faction lookup for region gating.
-                // This is the authoritative mapping used by OnSpawnConditionCheck.
-                _spawnGroupFactionMap.Clear();
-                foreach (var kvp in factionMap)
-                    foreach (var entry in kvp.Value)
-                        if (!_spawnGroupFactionMap.ContainsKey(entry.SubtypeId))
-                            _spawnGroupFactionMap[entry.SubtypeId] = kvp.Key;
 
                 string xml = BuildBaselineXml(factionMap);
 
@@ -341,7 +329,8 @@ namespace MESDC
             sb.AppendLine("<MESDC>");
             sb.AppendLine();
 
-            sb.AppendLine("  <!-- ===============================================");
+            sb.AppendLine("  <!-- ═══════════════════════════════════════════"
+                        + "═══════════════════");
             sb.AppendLine("       GLOBAL OVERRIDES");
             sb.AppendLine("       Populated with documented MES defaults.");
             sb.AppendLine("       MESDC cannot read live MES config values");
@@ -350,18 +339,21 @@ namespace MESDC
             sb.AppendLine("       MES config files are at:");
             sb.AppendLine("         [WorldSave]\\Storage\\"
                         + "1521905890.sbm_ModularEncountersSpawner\\");
-            sb.AppendLine("       =============================================== -->");
+            sb.AppendLine("       ════════════════════════════════════════════"
+                        + "══════════════════ -->");
             sb.AppendLine("  <GlobalOverrides>");
             WriteGlobalOverridesDefaults(sb);
             sb.AppendLine("  </GlobalOverrides>");
             sb.AppendLine();
 
-            sb.AppendLine("  <!-- ===============================================");
+            sb.AppendLine("  <!-- ═══════════════════════════════════════════"
+                        + "═══════════════════");
             sb.AppendLine("       FACTIONS");
             sb.AppendLine(string.Format(
                 "       {0} faction(s) detected from live SpawnGroup definitions.",
                 factionMap.Count));
-            sb.AppendLine("       =============================================== -->");
+            sb.AppendLine("       ════════════════════════════════════════════"
+                        + "══════════════════ -->");
             sb.AppendLine("  <Factions>");
 
             var factionKeys = new List<string>(factionMap.Keys);
@@ -455,8 +447,13 @@ namespace MESDC
 
             if (isGoby)
             {
-                sb.AppendLine("    <!-- GOBY faction: " + factionTag
-                            + " -- full annotation in MESDC-Config.xml -->");
+                sb.AppendLine("    <!-- ╔════════════════════════════════════"
+                            + "═══════════════════════╗");
+                sb.AppendLine("         ║  " + factionTag
+                            + " — GOBY faction. Full annotation in"
+                            + " MESDC-Config.xml.  ║");
+                sb.AppendLine("         ╚════════════════════════════════════"
+                            + "═══════════════════════╝ -->");
             }
             else if (isPromotedMod)
             {
@@ -470,12 +467,20 @@ namespace MESDC
             else if (isVanilla)
             {
                 sb.AppendLine("    <!-- (vanilla): vanilla SE SpawnGroups with"
-                            + " no [FactionOwner] tag. -->");
+                            + " no [FactionOwner] tag.");
+                sb.AppendLine("         These are not a real MES faction."
+                            + " MESDC groups them here for reference.");
+                sb.AppendLine("         FactionEnabled and per-SpawnGroup"
+                            + " overrides are supported. -->");
             }
             else if (isUntaggedMod)
             {
                 sb.AppendLine("    <!-- (untagged-mod): mod-added SpawnGroups"
-                            + " with no [FactionOwner] tag. -->");
+                            + " with no [FactionOwner] tag.");
+                sb.AppendLine("         These are not a real MES faction."
+                            + " Check ModSource attribute to identify origin.");
+                sb.AppendLine("         FactionEnabled and per-SpawnGroup"
+                            + " overrides are supported. -->");
             }
 
             sb.AppendLine("    <Faction Tag=\"" + factionTag + "\">");
@@ -692,7 +697,7 @@ namespace MESDC
             sb.AppendLine("     customise MES spawn behaviour.");
             sb.AppendLine("     Omit or comment out any element to leave");
             sb.AppendLine("     the corresponding MES value untouched.");
-            sb.AppendLine("     ----------------------------------------");
+            sb.AppendLine("     ───────────────────────────────────────────");
             sb.AppendLine("     WARNING: /MESDC INIT will overwrite this");
             sb.AppendLine("     file without confirmation. Back up your");
             sb.AppendLine("     settings before running that command.");
@@ -703,9 +708,11 @@ namespace MESDC
 
             WriteConfigGlobalOverrides(sb);
 
-            sb.AppendLine("  <!-- ===============================================");
+            sb.AppendLine("  <!-- ═══════════════════════════════════════════"
+                        + "═══════════════════");
             sb.AppendLine("       FACTIONS");
-            sb.AppendLine("       =============================================== -->");
+            sb.AppendLine("       ════════════════════════════════════════════"
+                        + "══════════════════ -->");
             sb.AppendLine("  <Factions>");
 
             foreach (var faction in factions)
@@ -736,7 +743,8 @@ namespace MESDC
 
         private void WriteConfigGlobalOverrides(StringBuilder sb)
         {
-            sb.AppendLine("  <!-- ===============================================");
+            sb.AppendLine("  <!-- ═══════════════════════════════════════════"
+                        + "═══════════════════");
             sb.AppendLine("       GLOBAL OVERRIDES");
             sb.AppendLine("       These values are written to the corresponding");
             sb.AppendLine("       MES Config-*.xml files on server startup.");
@@ -744,7 +752,8 @@ namespace MESDC
             sb.AppendLine("       Verify current MES values at:");
             sb.AppendLine("         [WorldSave]\\Storage\\"
                         + "1521905890.sbm_ModularEncountersSpawner\\");
-            sb.AppendLine("       =============================================== -->");
+            sb.AppendLine("       ════════════════════════════════════════════"
+                        + "══════════════════ -->");
             sb.AppendLine("  <GlobalOverrides>");
 
             sb.AppendLine("    <General>");
@@ -846,11 +855,16 @@ namespace MESDC
             BaselineFaction faction)
         {
             sb.AppendLine();
-            sb.AppendLine("    <!-- ============================================");
-            sb.AppendLine("         SPRT -- Space Pirates (vanilla Keen faction)");
-            sb.AppendLine("         GOBY: Every available override is shown.");
-            sb.AppendLine("         Copy elements into other faction blocks.");
-            sb.AppendLine("         ============================================ -->");
+            sb.AppendLine("    <!-- ╔══════════════════════════════════════════"
+                        + "═══════════════════╗");
+            sb.AppendLine("         ║  SPRT — Space Pirates (vanilla Keen"
+                        + " faction)                    ║");
+            sb.AppendLine("         ║  GOBY: Every available override is shown"
+                        + " and documented.    ║");
+            sb.AppendLine("         ║  Copy elements from this block into other"
+                        + " faction blocks.   ║");
+            sb.AppendLine("         ╚══════════════════════════════════════════"
+                        + "═══════════════════╝ -->");
             sb.AppendLine("    <Faction Tag=\"SPRT\">");
             sb.AppendLine();
             sb.AppendLine("      <!-- Disable this entire faction.");
@@ -858,29 +872,24 @@ namespace MESDC
             sb.AppendLine("           Default: true -->");
             sb.AppendLine("      <FactionEnabled>true</FactionEnabled>");
             sb.AppendLine();
-            sb.AppendLine("      <!-- ~~~ Region Gating (MESDC feature) ~~~~~~~~~");
-            sb.AppendLine("           Lock or exclude this faction from regions.");
-            sb.AppendLine("           Mode: Lock   = ONLY spawns inside a region");
-            sb.AppendLine("                 Exclude = NEVER spawns inside a region");
-            sb.AppendLine("           Multiple Region blocks = OR logic.");
-            sb.AppendLine("           Conditions within one Region = AND logic.");
+            sb.AppendLine("      <!-- ~~~ Region Gating (MESDC feature) ~~~~~~");
+            sb.AppendLine("           Mode: Lock   = ONLY spawns inside region");
+            sb.AppendLine("                 Exclude = NEVER spawns inside region");
+            sb.AppendLine("           Region types: GPS, Planet, Gravity");
             sb.AppendLine("           Remove this block entirely for no gating.");
-            sb.AppendLine("           GPS radius is in metres.");
-            sb.AppendLine("           Gravity MinG/MaxG are in g (1.0 = Earth). -->");
+            sb.AppendLine("           Multiple Region elements = OR logic. -->");
             sb.AppendLine("      <!-- <RegionGating Mode=\"Lock\">");
-            sb.AppendLine("             <Region Label=\"Near outpost\">");
-            sb.AppendLine("               <GPS X=\"0\" Y=\"0\" Z=\"0\""
-                        + " RadiusM=\"50000\" />");
+            sb.AppendLine("             <Region Type=\"GPS\">");
+            sb.AppendLine("               <Label>ExampleRegion</Label>");
+            sb.AppendLine("               <X>0</X><Y>0</Y><Z>0</Z>");
+            sb.AppendLine("               <RadiusM>100000</RadiusM>");
             sb.AppendLine("             </Region>");
-            sb.AppendLine("             <Region Label=\"On EarthLike\">");
-            sb.AppendLine("               <Planet>EarthLike</Planet>");
+            sb.AppendLine("             <Region Type=\"Planet\">");
+            sb.AppendLine("               <PlanetName>EarthLike</PlanetName>");
             sb.AppendLine("             </Region>");
-            sb.AppendLine("             <Region Label=\"Low gravity space\">");
-            sb.AppendLine("               <Gravity MinG=\"0.0\" MaxG=\"0.1\" />");
-            sb.AppendLine("             </Region>");
-            sb.AppendLine("             <Region Label=\"EarthLike surface only\">");
-            sb.AppendLine("               <Planet>EarthLike</Planet>");
-            sb.AppendLine("               <Gravity MinG=\"0.8\" MaxG=\"1.2\" />");
+            sb.AppendLine("             <Region Type=\"Gravity\">");
+            sb.AppendLine("               <MinG>0.0</MinG>");
+            sb.AppendLine("               <MaxG>0.5</MaxG>");
             sb.AppendLine("             </Region>");
             sb.AppendLine("           </RegionGating> -->");
             sb.AppendLine();
@@ -924,12 +933,14 @@ namespace MESDC
             BaselineFaction faction)
         {
             sb.AppendLine();
-            sb.AppendLine("    <!-- " + faction.Tag
-                        + " -- copy overrides from SPRT GOBY as needed. -->");
+            sb.AppendLine("    <!-- ── " + faction.Tag
+                        + " ─────────────────────────────────────────────");
+            sb.AppendLine("         Copy override elements from the SPRT GOBY");
+            sb.AppendLine("         block above as needed. -->");
             sb.AppendLine("    <Faction Tag=\"" + faction.Tag + "\">");
             sb.AppendLine("      <FactionEnabled>true</FactionEnabled>");
-            sb.AppendLine("      <!-- <RegionGating Mode=\"Lock\"> ..."
-                        + " </RegionGating> -->");
+            sb.AppendLine("      <!-- <RegionGating Mode=\"Lock\"> ... "
+                        + "</RegionGating> -->");
             sb.AppendLine("      <SpawnGroups>");
 
             foreach (var sg in faction.SpawnGroups)
@@ -954,9 +965,13 @@ namespace MESDC
                 StringComparison.OrdinalIgnoreCase);
 
             sb.AppendLine();
-            sb.AppendLine("    <!-- " + faction.Tag + " -- "
-                + (isVanilla ? "Vanilla SE SpawnGroups."
-                             : "Mod-added untagged SpawnGroups.") + " -->");
+            sb.AppendLine("    <!-- ── " + faction.Tag
+                        + " ─────────────────────────────────────");
+            if (isVanilla)
+                sb.AppendLine("         Vanilla SE SpawnGroups. -->");
+            else
+                sb.AppendLine("         Mod-added untagged SpawnGroups. -->");
+
             sb.AppendLine("    <Faction Tag=\"" + faction.Tag + "\">");
             sb.AppendLine("      <FactionEnabled>true</FactionEnabled>");
             sb.AppendLine("      <SpawnGroups>");
@@ -992,6 +1007,18 @@ namespace MESDC
 
         // ─── Layer 4: Apply Pass ──────────────────────────────────────────────
 
+        /// <summary>
+        /// Reads MESDC-Config.xml and applies all overrides. Called once from
+        /// UpdateAfterSimulation after MES API becomes ready.
+        /// 
+        /// Apply order:
+        ///   1. GlobalOverrides → write to MES Config-*.xml files on disk
+        ///   2. Faction.FactionEnabled=false → ToggleSpawnGroupEnabled(id, false)
+        ///      for every SpawnGroup in that faction
+        ///   3. SpawnGroup.Enabled=false → ToggleSpawnGroupEnabled(id, false)
+        ///   4. SpawnGroup.SpawnFrequency → patch Frequency on live definition
+        ///   5. SpawnGroup.WeaponRandomizerEnabled=true → patch DescriptionString
+        /// </summary>
         private void ApplyConfig()
         {
             Log("ApplyConfig: starting.");
@@ -1005,8 +1032,11 @@ namespace MESDC
 
             var config = ParseConfig(configXml);
 
+            // ── 1. GlobalOverrides ────────────────────────────────────────────
             ApplyGlobalOverrides(config.GlobalOverrides);
 
+            // ── 2–5. Faction and SpawnGroup overrides ─────────────────────────
+            // Build a lookup of live SpawnGroup definitions for fast access.
             var liveDefinitions = BuildSpawnGroupLookup();
 
             int toggled   = 0;
@@ -1019,6 +1049,8 @@ namespace MESDC
 
                 foreach (var sg in faction.SpawnGroups)
                 {
+                    // FactionEnabled=false overrides individual SpawnGroup
+                    // enabled state — if the faction is off, everything is off.
                     bool shouldBeEnabled = factionEnabled && sg.Enabled;
 
                     if (!shouldBeEnabled)
@@ -1026,77 +1058,75 @@ namespace MESDC
                         _mes.ToggleSpawnGroupEnabled(sg.SubtypeId, false);
                         toggled++;
                         Log(string.Format(
-                            "ApplyConfig: disabled SpawnGroup '{0}'",
-                            sg.SubtypeId));
+                            "ApplyConfig: disabled SpawnGroup '{0}'" +
+                            " (faction enabled={1}, sg enabled={2})",
+                            sg.SubtypeId, factionEnabled, sg.Enabled));
                     }
 
+                    // SpawnFrequency — patch live definition directly.
                     if (sg.FrequencyOverride.HasValue)
                     {
                         MySpawnGroupDefinition def;
-                        if (liveDefinitions.TryGetValue(sg.SubtypeId, out def))
+                        if (liveDefinitions.TryGetValue(
+                            sg.SubtypeId, out def))
                         {
                             def.Frequency = sg.FrequencyOverride.Value;
                             patched++;
+                            Log(string.Format(
+                                "ApplyConfig: set Frequency={0:F1} on '{1}'",
+                                sg.FrequencyOverride.Value, sg.SubtypeId));
                         }
                         else
                         {
                             Log(string.Format(
-                                "ApplyConfig: WARNING -- SpawnGroup '{0}'" +
-                                " not found for frequency patch.", sg.SubtypeId));
+                                "ApplyConfig: WARNING — SpawnGroup '{0}'" +
+                                " not found in live definitions for" +
+                                " frequency patch.", sg.SubtypeId));
                         }
                     }
 
+                    // WeaponRandomizerEnabled — patch DescriptionString.
                     if (sg.WeaponRandomizerOverride.HasValue)
                     {
                         MySpawnGroupDefinition def;
-                        if (liveDefinitions.TryGetValue(sg.SubtypeId, out def))
+                        if (liveDefinitions.TryGetValue(
+                            sg.SubtypeId, out def))
                         {
                             PatchDescriptionTag(def,
                                 "UseWeaponRandomizerOnSpawn",
                                 sg.WeaponRandomizerOverride.Value
                                     ? "true" : "false");
                             wrPatched++;
+                            Log(string.Format(
+                                "ApplyConfig: set UseWeaponRandomizerOnSpawn" +
+                                "={0} on '{1}'",
+                                sg.WeaponRandomizerOverride.Value,
+                                sg.SubtypeId));
+                        }
+                        else
+                        {
+                            Log(string.Format(
+                                "ApplyConfig: WARNING — SpawnGroup '{0}'" +
+                                " not found for weapon randomizer patch.",
+                                sg.SubtypeId));
                         }
                     }
                 }
-
-                // Register region gating rules for this faction.
-                if (faction.GatingRules != null)
-                {
-                    _factionGatingRules[faction.Tag] = faction.GatingRules;
-                    Log(string.Format(
-                        "ApplyConfig: registered region gating for faction" +
-                        " '{0}' (Mode={1}, Regions={2}).",
-                        faction.Tag,
-                        faction.GatingRules.Mode,
-                        faction.GatingRules.Regions.Count));
-                }
-            }
-
-            // Register MESDC's spawn condition callback with MES.
-            if (_factionGatingRules.Count > 0)
-            {
-                _mes.RegisterCustomSpawnCondition(true, "MESDC-RegionGate",
-                    OnSpawnConditionCheck);
-                Log(string.Format(
-                    "ApplyConfig: registered spawn condition callback for" +
-                    " {0} faction(s) with region gating.",
-                    _factionGatingRules.Count));
-            }
-            else
-            {
-                Log("ApplyConfig: no region gating configured -- " +
-                    "spawn condition callback not registered.");
             }
 
             Log(string.Format(
-                "ApplyConfig: complete. {0} disabled, {1} frequencies" +
-                " patched, {2} weapon randomizer flags patched.",
+                "ApplyConfig: complete. " +
+                "{0} SpawnGroups disabled, " +
+                "{1} frequencies patched, " +
+                "{2} weapon randomizer flags patched.",
                 toggled, patched, wrPatched));
         }
 
-        private Dictionary<string, MySpawnGroupDefinition>
-            BuildSpawnGroupLookup()
+        /// <summary>
+        /// Builds a case-insensitive dictionary of SubtypeId → live definition
+        /// from MyDefinitionManager for fast lookup during the apply pass.
+        /// </summary>
+        private Dictionary<string, MySpawnGroupDefinition> BuildSpawnGroupLookup()
         {
             var lookup = new Dictionary<string, MySpawnGroupDefinition>(
                 StringComparer.OrdinalIgnoreCase);
@@ -1115,6 +1145,11 @@ namespace MESDC
             return lookup;
         }
 
+        /// <summary>
+        /// Patches or inserts a MES description tag in a live SpawnGroup
+        /// definition's DescriptionString. If the tag already exists it is
+        /// replaced in-place; otherwise it is appended.
+        /// </summary>
         private static void PatchDescriptionTag(
             MySpawnGroupDefinition def, string tagName, string value)
         {
@@ -1125,6 +1160,7 @@ namespace MESDC
 
             if (start >= 0)
             {
+                // Replace existing tag value.
                 int valueStart = start + search.Length;
                 int valueEnd   = current.IndexOf(']', valueStart);
                 if (valueEnd >= 0)
@@ -1137,10 +1173,29 @@ namespace MESDC
                 }
             }
 
+            // Tag not present — append it.
             def.DescriptionString = current.TrimEnd()
                 + "\n[" + tagName + ":" + value + "]";
         }
 
+        // ─── GlobalOverrides apply ────────────────────────────────────────────
+
+        /// <summary>
+        /// Writes GlobalOverrides values to MES Config-*.xml files on disk.
+        /// Only elements present (non-null) in the parsed config are written.
+        /// Each MES config file is read, the relevant fields updated in-place
+        /// using the same hand-rolled string approach, then written back.
+        /// </summary>
+        /// <summary>
+        /// GlobalOverrides advisory pass. SE's mod sandbox prohibits direct
+        /// namespace references to other mods, System.IO.File, and
+        /// System.Reflection — all three approaches to programmatic MES config
+        /// patching are blocked. GlobalOverrides values present in
+        /// MESDC-Config.xml are logged here so the admin knows exactly what to
+        /// set and in which MES config file. Apply them manually to:
+        ///   [WorldSave]\Storage\1521905890.sbm_ModularEncountersSpawner\
+        /// Once set manually, MES persists them and they survive restarts.
+        /// </summary>
         private void ApplyGlobalOverrides(ConfigGlobalOverrides overrides)
         {
             if (overrides == null)
@@ -1150,15 +1205,15 @@ namespace MESDC
 
             var allSections = new Dictionary<string, Dictionary<string, string>>
             {
-                { "Config-General.xml",                overrides.GeneralFields },
-                { "Config-Grids.xml",                  overrides.GridsFields },
-                { "Config-SpaceCargoShips.xml",        overrides.SpaceCargoShipFields },
-                { "Config-RandomEncounters.xml",       overrides.RandomEncounterFields },
-                { "Config-PlanetaryCargoShips.xml",    overrides.PlanetaryCargoShipFields },
-                { "Config-PlanetaryInstallations.xml", overrides.PlanetaryInstallationFields },
-                { "Config-BossEncounters.xml",         overrides.BossEncounterFields },
-                { "Config-Combat.xml",                 overrides.CombatFields },
-                { "Config-*.xml (Cleanup)",            overrides.CleanupFields },
+                { "Config-General.xml",               overrides.GeneralFields },
+                { "Config-Grids.xml",                 overrides.GridsFields },
+                { "Config-SpaceCargoShips.xml",       overrides.SpaceCargoShipFields },
+                { "Config-RandomEncounters.xml",      overrides.RandomEncounterFields },
+                { "Config-PlanetaryCargoShips.xml",   overrides.PlanetaryCargoShipFields },
+                { "Config-PlanetaryInstallations.xml",overrides.PlanetaryInstallationFields },
+                { "Config-BossEncounters.xml",        overrides.BossEncounterFields },
+                { "Config-Combat.xml",                overrides.CombatFields },
+                { "Config-*.xml (Cleanup)",           overrides.CleanupFields },
             };
 
             foreach (var section in allSections)
@@ -1187,34 +1242,39 @@ namespace MESDC
                 Log("ApplyGlobalOverrides: no GlobalOverrides active in config.");
         }
 
+        // ─── Config Parser ────────────────────────────────────────────────────
+
+        /// <summary>
+        /// Parses MESDC-Config.xml into a ConfigDocument using the same
+        /// hand-rolled line parser as ParseBaselineFactions. Only elements
+        /// that are actually present (uncommented) in the file are parsed —
+        /// absent elements are left as null/HasValue=false so the apply pass
+        /// knows to skip them.
+        /// </summary>
         private ConfigDocument ParseConfig(string xml)
         {
             var doc = new ConfigDocument
             {
                 GlobalOverrides = new ConfigGlobalOverrides
                 {
-                    GeneralFields               = new Dictionary<string, string>(),
-                    GridsFields                 = new Dictionary<string, string>(),
-                    SpaceCargoShipFields        = new Dictionary<string, string>(),
-                    RandomEncounterFields       = new Dictionary<string, string>(),
-                    PlanetaryCargoShipFields    = new Dictionary<string, string>(),
-                    PlanetaryInstallationFields = new Dictionary<string, string>(),
-                    BossEncounterFields         = new Dictionary<string, string>(),
-                    CombatFields                = new Dictionary<string, string>(),
-                    CleanupFields               = new Dictionary<string, string>()
+                    GeneralFields              = new Dictionary<string, string>(),
+                    GridsFields                = new Dictionary<string, string>(),
+                    SpaceCargoShipFields       = new Dictionary<string, string>(),
+                    RandomEncounterFields      = new Dictionary<string, string>(),
+                    PlanetaryCargoShipFields   = new Dictionary<string, string>(),
+                    PlanetaryInstallationFields= new Dictionary<string, string>(),
+                    BossEncounterFields        = new Dictionary<string, string>(),
+                    CombatFields               = new Dictionary<string, string>(),
+                    CleanupFields              = new Dictionary<string, string>()
                 },
                 Factions = new List<ConfigFaction>()
             };
 
+            // Section tracking.
             string         currentSection  = null;
             ConfigFaction  currentFaction  = null;
             ConfigSgEntry  currentSg       = new ConfigSgEntry();
             bool           inSpawnGroup    = false;
-
-            // Region gating parse state
-            FactionGatingRules currentGating = null;
-            RegionCondition    currentRegion = null;
-            bool               inRegion      = false;
 
             string[] lines = xml.Split('\n');
 
@@ -1276,6 +1336,8 @@ namespace MESDC
                 // ── GlobalOverrides field capture ─────────────────────────────
                 if (currentSection != null && currentFaction == null)
                 {
+                    // Any <ElementName>value</ElementName> on this line goes
+                    // into the appropriate section dictionary.
                     string elemName;
                     string elemVal;
                     if (TryParseAnyXmlElement(line, out elemName, out elemVal))
@@ -1293,27 +1355,20 @@ namespace MESDC
                 {
                     currentFaction = new ConfigFaction
                     {
-                        Tag            = ParseXmlAttribute(line, "Tag"),
+                        Tag          = ParseXmlAttribute(line, "Tag"),
                         FactionEnabled = true,
-                        SpawnGroups    = new List<ConfigSgEntry>(),
-                        GatingRules    = null
+                        SpawnGroups  = new List<ConfigSgEntry>()
                     };
                     doc.Factions.Add(currentFaction);
                     inSpawnGroup   = false;
                     currentSection = null;
-                    currentGating  = null;
-                    currentRegion  = null;
-                    inRegion       = false;
                     continue;
                 }
 
                 if (line.StartsWith("</Faction>"))
                 {
                     currentFaction = null;
-                    currentGating  = null;
-                    currentRegion  = null;
                     inSpawnGroup   = false;
-                    inRegion       = false;
                     continue;
                 }
 
@@ -1330,155 +1385,21 @@ namespace MESDC
                     continue;
                 }
 
-                // ── RegionGating block ────────────────────────────────────────
-                if (line.StartsWith("<RegionGating"))
-                {
-                    string mode = ParseXmlAttribute(line, "Mode");
-                    currentGating = new FactionGatingRules
-                    {
-                        Mode    = string.Equals(mode, "Exclude",
-                            StringComparison.OrdinalIgnoreCase)
-                            ? GatingMode.Exclude
-                            : GatingMode.Lock,
-                        Regions = new List<RegionCondition>()
-                    };
-                    currentFaction.GatingRules = currentGating;
-                    continue;
-                }
-
-                if (line.StartsWith("</RegionGating>"))
-                {
-                    currentGating = null;
-                    inRegion      = false;
-                    currentRegion = null;
-                    continue;
-                }
-
-                if (currentGating != null)
-                {
-                    if (line.StartsWith("<Region"))
-                    {
-                        currentRegion = new RegionCondition
-                        {
-                            Label      = ParseXmlAttribute(line, "Label"),
-                            GpsCondition     = null,
-                            PlanetCondition  = null,
-                            GravityCondition = null
-                        };
-                        currentGating.Regions.Add(currentRegion);
-                        inRegion = true;
-                        continue;
-                    }
-
-                    if (line.StartsWith("</Region>"))
-                    {
-                        inRegion      = false;
-                        currentRegion = null;
-                        continue;
-                    }
-
-                    if (inRegion && currentRegion != null)
-                    {
-                        // GPS condition: <GPS X="..." Y="..." Z="..."
-                        //                    RadiusM="..." />
-                        if (line.StartsWith("<GPS "))
-                        {
-                            string xStr = ParseXmlAttribute(line, "X");
-                            string yStr = ParseXmlAttribute(line, "Y");
-                            string zStr = ParseXmlAttribute(line, "Z");
-                            string rStr = ParseXmlAttribute(line, "RadiusM");
-
-                            double x, y, z, r;
-                            if (double.TryParse(xStr,
-                                    System.Globalization.NumberStyles.Float,
-                                    System.Globalization.CultureInfo
-                                        .InvariantCulture, out x)
-                                && double.TryParse(yStr,
-                                    System.Globalization.NumberStyles.Float,
-                                    System.Globalization.CultureInfo
-                                        .InvariantCulture, out y)
-                                && double.TryParse(zStr,
-                                    System.Globalization.NumberStyles.Float,
-                                    System.Globalization.CultureInfo
-                                        .InvariantCulture, out z)
-                                && double.TryParse(rStr,
-                                    System.Globalization.NumberStyles.Float,
-                                    System.Globalization.CultureInfo
-                                        .InvariantCulture, out r))
-                            {
-                                currentRegion.GpsCondition = new GpsCondition
-                                {
-                                    Centre   = new Vector3D(x, y, z),
-                                    RadiusM  = r
-                                };
-                            }
-                            else
-                            {
-                                Log("ParseConfig: WARNING -- malformed GPS" +
-                                    " condition in faction '" +
-                                    currentFaction.Tag + "': " + line);
-                            }
-                            continue;
-                        }
-
-                        // Planet condition: <Planet>PlanetName</Planet>
-                        string planetVal;
-                        if (TryParseXmlElement(line, "Planet", out planetVal))
-                        {
-                            currentRegion.PlanetCondition =
-                                new PlanetCondition { PlanetName = planetVal };
-                            continue;
-                        }
-
-                        // Gravity condition: <Gravity MinG="..." MaxG="..." />
-                        if (line.StartsWith("<Gravity "))
-                        {
-                            string minStr = ParseXmlAttribute(line, "MinG");
-                            string maxStr = ParseXmlAttribute(line, "MaxG");
-
-                            float minG, maxG;
-                            if (float.TryParse(minStr,
-                                    System.Globalization.NumberStyles.Float,
-                                    System.Globalization.CultureInfo
-                                        .InvariantCulture, out minG)
-                                && float.TryParse(maxStr,
-                                    System.Globalization.NumberStyles.Float,
-                                    System.Globalization.CultureInfo
-                                        .InvariantCulture, out maxG))
-                            {
-                                currentRegion.GravityCondition =
-                                    new GravityCondition
-                                    {
-                                        MinG = minG,
-                                        MaxG = maxG
-                                    };
-                            }
-                            else
-                            {
-                                Log("ParseConfig: WARNING -- malformed Gravity" +
-                                    " condition in faction '" +
-                                    currentFaction.Tag + "': " + line);
-                            }
-                            continue;
-                        }
-                    }
-                    continue;
-                }
-
-                // ── SpawnGroup entries ────────────────────────────────────────
+                // SpawnGroup open tag
                 if (line.StartsWith("<SpawnGroup "))
                 {
                     currentSg = new ConfigSgEntry
                     {
-                        SubtypeId                = ParseXmlAttribute(line, "SubtypeId"),
-                        Enabled                  = true,
-                        FrequencyOverride        = null,
+                        SubtypeId              = ParseXmlAttribute(line, "SubtypeId"),
+                        Enabled                = true,
+                        FrequencyOverride      = null,
                         WeaponRandomizerOverride = null
                     };
                     inSpawnGroup = true;
                     continue;
                 }
 
+                // SpawnGroup close tag
                 if (line.StartsWith("</SpawnGroup>"))
                 {
                     if (inSpawnGroup)
@@ -1490,6 +1411,7 @@ namespace MESDC
                 if (!inSpawnGroup)
                     continue;
 
+                // SpawnGroup child elements
                 string val;
 
                 if (TryParseXmlElement(line, "Enabled", out val))
@@ -1525,6 +1447,11 @@ namespace MESDC
             return doc;
         }
 
+        /// <summary>
+        /// Attempts to parse any single-line XML element, returning its name
+        /// and inner text. Used for GlobalOverrides field capture where element
+        /// names are not known in advance.
+        /// </summary>
         private static bool TryParseAnyXmlElement(string line,
             out string elemName, out string elemValue)
         {
@@ -1539,9 +1466,9 @@ namespace MESDC
             if (nameEnd < 0)
                 return false;
 
-            string name = line.Substring(openStart + 1,
-                nameEnd - openStart - 1);
+            string name = line.Substring(openStart + 1, nameEnd - openStart - 1);
 
+            // Skip tags with attributes (they're container elements, not values)
             if (name.Contains(' ') || name.Contains('/'))
                 return false;
 
@@ -1558,6 +1485,9 @@ namespace MESDC
             return true;
         }
 
+        /// <summary>
+        /// Returns the correct field dictionary for a given section name.
+        /// </summary>
         private static Dictionary<string, string> GetSectionDict(
             ConfigGlobalOverrides overrides, string section)
         {
@@ -1599,10 +1529,9 @@ namespace MESDC
 
         private class ConfigFaction
         {
-            public string              Tag;
-            public bool                FactionEnabled;
+            public string           Tag;
+            public bool             FactionEnabled;
             public List<ConfigSgEntry> SpawnGroups;
-            public FactionGatingRules  GatingRules;
         }
 
         private struct ConfigSgEntry
@@ -1613,149 +1542,13 @@ namespace MESDC
             public bool?   WeaponRandomizerOverride;
         }
 
-        // ─── Layer 5: Region Gating types ────────────────────────────────────
-
-        private enum GatingMode { Lock, Exclude }
-
-        private class FactionGatingRules
-        {
-            public GatingMode          Mode;
-            public List<RegionCondition> Regions;
-        }
-
-        private class RegionCondition
-        {
-            public string          Label;
-            public GpsCondition    GpsCondition;
-            public PlanetCondition PlanetCondition;
-            public GravityCondition GravityCondition;
-        }
-
-        private class GpsCondition
-        {
-            public Vector3D Centre;
-            public double   RadiusM;
-        }
-
-        private class PlanetCondition
-        {
-            public string PlanetName;
-        }
-
-        private class GravityCondition
-        {
-            public float MinG;
-            public float MaxG;
-        }
-
-        // ─── Layer 5: Spawn Condition Callback ───────────────────────────────
-
-        /// <summary>
-        /// Called by MES for every spawn eligibility check.
-        /// Parameters:
-        ///   spawnGroupId  — SpawnGroup SubtypeId being evaluated
-        ///   spawnCondition — MES internal spawn condition context string
-        ///   spawnType     — spawn type string (e.g. "SpaceCargoShip")
-        ///   position      — proposed world spawn position
-        ///
-        /// Returns true to allow the spawn, false to block it.
-        /// Called on the game thread — keep this fast.
-        /// </summary>
-        private bool OnSpawnConditionCheck(string spawnGroupId,
-            string spawnCondition, string spawnType, Vector3D position)
-        {
-            // Look up which faction owns this SpawnGroup.
-            string factionTag;
-            if (!_spawnGroupFactionMap.TryGetValue(spawnGroupId, out factionTag))
-                return true; // Unknown SpawnGroup — allow by default.
-
-            // Check if this faction has gating rules.
-            FactionGatingRules rules;
-            if (!_factionGatingRules.TryGetValue(factionTag, out rules))
-                return true; // No gating for this faction — allow.
-
-            // Evaluate whether the position satisfies any Region block.
-            // Multiple Regions = OR logic.
-            // Conditions within one Region = AND logic.
-            bool anyRegionMatched = false;
-
-            foreach (var region in rules.Regions)
-            {
-                if (RegionMatches(region, position))
-                {
-                    anyRegionMatched = true;
-                    break;
-                }
-            }
-
-            // Apply Mode logic.
-            if (rules.Mode == GatingMode.Lock)
-            {
-                // Lock: allow only if inside a region.
-                return anyRegionMatched;
-            }
-            else
-            {
-                // Exclude: allow only if outside all regions.
-                return !anyRegionMatched;
-            }
-        }
-
-        /// <summary>
-        /// Returns true if the position satisfies ALL conditions in the region
-        /// (AND logic within a region block).
-        /// </summary>
-        private bool RegionMatches(RegionCondition region, Vector3D position)
-        {
-            // GPS condition: position must be within RadiusM of Centre.
-            if (region.GpsCondition != null)
-            {
-                double dist = Vector3D.Distance(position,
-                    region.GpsCondition.Centre);
-                if (dist > region.GpsCondition.RadiusM)
-                    return false;
-            }
-
-            // Planet condition: nearest planet must match PlanetName.
-            if (region.PlanetCondition != null)
-            {
-                var planet = MyGamePruningStructure
-                    .GetClosestPlanet(position);
-
-                if (planet == null)
-                    return false;
-
-                // Planet SubtypeId is in the StorageName.
-                // MyPlanet.StorageName is the voxel file name without extension
-                // which matches the planet SubtypeId (e.g. "EarthLike",
-                // "Mars", "Pertam").
-                string planetName = planet.StorageName ?? string.Empty;
-
-                if (!string.Equals(planetName,
-                    region.PlanetCondition.PlanetName,
-                    StringComparison.OrdinalIgnoreCase))
-                    return false;
-            }
-
-            // Gravity condition: gravity magnitude at position must be
-            // within [MinG, MaxG] in g (1 g = 9.81 m/s^2).
-            if (region.GravityCondition != null)
-            {
-                Vector3 gravVec = MyAPIGateway.Physics
-                    .CalculateNaturalGravityAt(position, out _);
-                float gravG = gravVec.Length() / 9.81f;
-
-                if (gravG < region.GravityCondition.MinG
-                    || gravG > region.GravityCondition.MaxG)
-                    return false;
-            }
-
-            // All conditions in this region passed.
-            return true;
-        }
-
         // ─── MES API wrapper ──────────────────────────────────────────────────
 
+        /// <summary>
+        /// Minimal MES API wrapper. Only the methods MESDC actually uses are
+        /// wired up. The full MESApi.cs from the MES repo can be dropped in
+        /// as a replacement if more methods are needed later.
+        /// </summary>
         private class MesApi
         {
             public bool Ready { get; private set; }
@@ -1763,9 +1556,8 @@ namespace MESDC
             private const long MES_ID = 1521905890L;
 
             private Action<string, bool> _toggleSpawnGroupEnabled;
-            private Action<bool, string,
-                Func<string, string, string, Vector3D, bool>>
-                _registerCustomSpawnCondition;
+            private Action<bool, string, Func<string, string, string,
+                VRageMath.Vector3D, bool>> _registerCustomSpawnCondition;
 
             public MesApi()
             {
@@ -1781,16 +1573,14 @@ namespace MESDC
 
             public void ToggleSpawnGroupEnabled(string subtypeId, bool enabled)
             {
-                if (_toggleSpawnGroupEnabled != null)
-                    _toggleSpawnGroupEnabled(subtypeId, enabled);
+                _toggleSpawnGroupEnabled?.Invoke(subtypeId, enabled);
             }
 
             public void RegisterCustomSpawnCondition(bool register,
                 string id,
-                Func<string, string, string, Vector3D, bool> func)
+                Func<string, string, string, VRageMath.Vector3D, bool> func)
             {
-                if (_registerCustomSpawnCondition != null)
-                    _registerCustomSpawnCondition(register, id, func);
+                _registerCustomSpawnCondition?.Invoke(register, id, func);
             }
 
             private void OnMessage(object data)
@@ -1802,12 +1592,11 @@ namespace MESDC
                         return;
 
                     _toggleSpawnGroupEnabled =
-                        (Action<string, bool>)
-                        dict["ToggleSpawnGroupEnabled"];
+                        (Action<string, bool>)dict["ToggleSpawnGroupEnabled"];
 
                     _registerCustomSpawnCondition =
-                        (Action<bool, string,
-                        Func<string, string, string, Vector3D, bool>>)
+                        (Action<bool, string, Func<string, string, string,
+                        VRageMath.Vector3D, bool>>)
                         dict["RegisterCustomSpawnCondition"];
 
                     Ready = true;
@@ -1884,7 +1673,7 @@ namespace MESDC
             }
 
             _awaitingInitConfirm = true;
-            Log("/MESDC INIT invoked -- awaiting confirmation.");
+            Log("/MESDC INIT invoked — awaiting confirmation.");
             SendReply("WARNING: /MESDC INIT will overwrite MESDC-Config.xml "
                     + "and discard ALL existing overrides. "
                     + "Back up the file first. "
